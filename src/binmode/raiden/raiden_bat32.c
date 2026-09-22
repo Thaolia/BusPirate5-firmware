@@ -471,6 +471,35 @@ static void cmd_arm(int argc, char* argv[]) {
         return;
     }
 
+    /* ⚠⚠ Un mot d'octets d'option a ZERO n'existe pas -- et c'est ce que la
+     * flash rend quand le debugger n'a PAS le droit de la lire.
+     *
+     * Mesure du 2026-09-22 : sur une piece au Level 1, ce banc rend
+     * 0x00000000 avec un ACK OK la ou le raiden rendait ACK=0x4. Meme etat,
+     * surface differente. ocden_read() lisait donc 0x00, en concluait « pas
+     * protegee », et lancait la sequence de programmation SUR UNE PIECE DEJA
+     * VERROUILLEE. Ici c'est sans effet, la programmation etant refusee au
+     * Level 1 -- mais programmer un octet d'option sur la foi d'une lecture
+     * qu'on ne peut pas croire est exactement ce que le message ci-dessous
+     * pretend refuser.
+     *
+     * ⚠ 0xFFFFFFFF reste ACCEPTE, a la difference de probe_level() qui refuse
+     * les deux : c'est la valeur LEGITIME d'un mot d'octets d'option vierge.
+     * Les octets d'option ne se programment que de 1 vers 0 ; un mot a zero
+     * voudrait dire WDT, LVD, HOCO et OCDEN tous programmes a 0x00, ce que
+     * personne ne fait. Les deux regles different parce que les deux
+     * contextes different -- une table de vecteurs effacee vaut 0xFFFFFFFF de
+     * plein droit, un mot d'octets d'option a zero, jamais. */
+    uint32_t cluster = 0;
+    if (opt_read(ocden_addr & ~3u, &cluster) && cluster == 0u) {
+        rp_err("Option-byte word at 0x%08X reads 0x00000000: that is not a value, "
+               "it is what the flash returns when the debugger may not read it. "
+               "Refusing to program blind -- the part is very likely ALREADY at "
+               "Level 1. Confirm with SWD OPT and the host's flash/SRAM contrast",
+               (unsigned)(ocden_addr & ~3u));
+        return;
+    }
+
     uint8_t before = 0;
     if (!ocden_read(ocden_addr, &before)) {
         rp_err("Cannot read OCDEN at 0x%08X: the debug port is not answering there. "
