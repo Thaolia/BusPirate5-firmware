@@ -43,6 +43,18 @@
 /** SWD BAT32 <...>. argv[0] is "SWD", argv[1] is "BAT32". */
 void raiden_bat32_command(int argc, char* argv[]);
 
+/** SWD OPT -- read the option bytes and DECLARE the protection level.
+ *
+ * READ-ONLY, and that is why it is here at all: it touches no flash controller
+ * and needs no CONFIRM.
+ *
+ * WARNING on what it is worth: the option bytes live in CODE FLASH, so they
+ * are unreadable at exactly the moment the question matters -- Level 1. This
+ * command DECLARES what the bytes say; only the host's flash/SRAM contrast
+ * MEASURES what the part actually does. Never use it as a lock oracle.
+ */
+void raiden_bat32_opt(void);
+
 /** Forget the once-per-session notices. Called on mode entry. */
 void raiden_bat32_init(void);
 

@@ -96,8 +96,15 @@ void rp_prompt(void) {
     rp_send("> ");
 }
 
-void rp_hexdump(uint32_t addr, const uint8_t* buf, uint32_t nbytes) {
+void rp_hexdump_begin(uint32_t addr, uint32_t nbytes) {
     rp_printf("Reading %u bytes from 0x%08X:\r\n", (unsigned)nbytes, (unsigned)addr);
+}
+
+void rp_hexdump_end(void) {
+    rp_send("OK: Read complete\r\n");
+}
+
+void rp_hexdump_lines(uint32_t addr, const uint8_t* buf, uint32_t nbytes) {
     for (uint32_t i = 0; i < nbytes; i += 16) {
         rp_printf("0x%08X:", (unsigned)(addr + i));
         for (uint32_t j = i; j < i + 16 && j < nbytes; j++) {
@@ -113,7 +120,6 @@ void rp_hexdump(uint32_t addr, const uint8_t* buf, uint32_t nbytes) {
         }
         rp_send("\r\n");
     }
-    rp_send("OK: Read complete\r\n");
 }
 
 void rp_words_line(uint32_t addr, const uint32_t* words, uint32_t nwords) {

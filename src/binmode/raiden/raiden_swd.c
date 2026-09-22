@@ -916,6 +916,31 @@ static void cmd_idcode(void) {
               (unsigned)((cpuid >> 20) & 0xFu), (unsigned)(cpuid & 0xFu));
 }
 
+/** SWD PHY -- accepte BITBANG, refuse PIO bruyamment.
+ *
+ * Le dialecte a deux couches physiques ; ce binmode n'en a qu'une, et c'est
+ * un choix : le budget PIO appartient au moteur de glitch, et le SWD est
+ * bit-bange pour ne rien lui prendre. Refuser PIO A VOIX HAUTE plutot que de
+ * l'accepter en ne faisant rien -- scripts/bat32_dump.py teste la reponse de
+ * `SWD PHY PIO` et s'arrete proprement sur un refus, alors qu'un acquittement
+ * menteur lui ferait dumper des heures en croyant tourner a 2,5 MHz.
+ */
+static void cmd_phy(int argc, char* argv[]) {
+    if (argc < 3) {
+        rp_ok("PHY: BITBANG (the only physical layer in this binmode)");
+        return;
+    }
+    if (strcmp(argv[2], "BITBANG") == 0) {
+        rp_ok("PHY: BITBANG");
+    } else if (strcmp(argv[2], "PIO") == 0) {
+        rp_err("SWD PHY PIO is not implemented here: the PIO budget belongs to "
+               "the glitch engine and this SWD is bit-banged on purpose. Use "
+               "SWD PHY BITBANG with SWD SPEED <n>.");
+    } else {
+        rp_err("Unknown SWD PHY '%s' (BITBANG only in this binmode)", argv[2]);
+    }
+}
+
 static void cmd_halt(void) {
     // One request does not always take on a core that is running -- which is
     // the BAT32 case, where SWD HALT is issued against application firmware in
@@ -930,6 +955,16 @@ static void cmd_halt(void) {
 
 static void cmd_read_mem(uint32_t addr, uint32_t nwords) {
     uint32_t done = 0;
+
+    // UN entete et UN trailer par COMMANDE, jamais par bloc. Le bloc de 16 mots
+    // est un detail de transport -- il existe pour ne pas noyer la FIFO TX, pas
+    // pour decouper la reponse. Une version anterieure emettait le hexdump
+    // COMPLET par bloc : une lecture de 256 mots rendait alors SEIZE
+    // "OK: Read complete". Un hote qui arrete sa lecture peu apres le premier
+    // marqueur -- ce que fait scripts/bat32_dump.py du raiden, 50 ms -- perdait
+    // tout le reste et ecrivait un dump silencieusement INCOMPLET. Le faux banc
+    // des tests n'en emettait qu'un seul, donc rien ne signalait l'ecart.
+    rp_hexdump_begin(addr, nwords * 4u);
     while (done < nwords) {
         uint32_t at = addr + done * 4u;
         uint32_t n = block_words(at, nwords - done);
@@ -942,9 +977,10 @@ static void cmd_read_mem(uint32_t addr, uint32_t nwords) {
                 return;
             }
         }
-        rp_hexdump(at, (const uint8_t*)mem_buf, n * 4u);
+        rp_hexdump_lines(at, (const uint8_t*)mem_buf, n * 4u);
         done += n;
     }
+    rp_hexdump_end();
 }
 
 static void cmd_read(int argc, char* argv[]) {
@@ -1136,7 +1172,7 @@ static void cmd_write(int argc, char* argv[]) {
 
 void raiden_swd_command(int argc, char* argv[]) {
     if (argc < 2) {
-        rp_err("Usage: SWD <CONNECT|IDCODE|HALT|SPEED|READ|WRITE|BAT32>");
+        rp_err("Usage: SWD <CONNECT|IDCODE|HALT|SPEED|PHY|OPT|READ|WRITE|BAT32>");
         swd_park_pins();
         return;
     }
@@ -1154,6 +1190,10 @@ void raiden_swd_command(int argc, char* argv[]) {
         if (ensure_connected()) {
             cmd_idcode();
         }
+    } else if (strcmp(sub, "PHY") == 0) {
+        cmd_phy(argc, argv);
+    } else if (strcmp(sub, "OPT") == 0) {
+        raiden_bat32_opt();
     } else if (strcmp(sub, "HALT") == 0) {
         if (ensure_connected()) {
             cmd_halt();
@@ -1167,7 +1207,7 @@ void raiden_swd_command(int argc, char* argv[]) {
         // let a campaign keep shooting and keep scoring, against a bench that
         // was not doing what the operator believes.
         rp_err("Unknown SWD sub-command '%s' "
-               "(use CONNECT/IDCODE/HALT/SPEED/READ/WRITE/BAT32)", sub);
+               "(use CONNECT/IDCODE/HALT/SPEED/PHY/OPT/READ/WRITE/BAT32)", sub);
     }
 
     // Released after EVERY command, not just at mode exit: the power cycle of

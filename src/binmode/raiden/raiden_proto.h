@@ -80,7 +80,9 @@ bool rp_take_truncated(void);
  * accepts. It is NOT the 4-words-per-line RAMREAD format -- the host refuses
  * to mix them on purpose, because confusing them reverses byte order.
  */
-void rp_hexdump(uint32_t addr, const uint8_t* buf, uint32_t nbytes);
+void rp_hexdump_begin(uint32_t addr, uint32_t nbytes);
+void rp_hexdump_lines(uint32_t addr, const uint8_t* buf, uint32_t nbytes);
+void rp_hexdump_end(void);
 
 /** One RAMREAD line: an address prefix and up to four 32-bit words.
  *

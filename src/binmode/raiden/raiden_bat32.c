@@ -485,3 +485,137 @@ void raiden_bat32_command(int argc, char* argv[]) {
     rp_err("Unknown SWD BAT32 operation '%s' (this binmode implements RAMREAD and "
            "ARM; the other destructive verbs are deliberately absent)", argv[2]);
 }
+
+/* --- SWD OPT : les octets d'option, en lecture seule ------------------ */
+
+#define OPT_CLUSTER0 0x000000C0u  /* mot portant OCDEN a 0x000000C3 */
+#define OPT_CLUSTER1 0x000001C0u  /* miroir boot-swap, OCDEN a 0x000001C3 */
+#define OPT_OCDM_BTEN 0x00500004u /* OCDM = octet 0, BTEN = bit 0 de l'octet 1 */
+#define OPT_DBGSTOPCR 0x4001B004u
+#define OPT_SWDIS (1u << 24)
+#define OCDEN_PROTECTED 0xC3u
+#define OCDM_LEVEL2 0x3Cu
+
+/** Une lecture d'octet d'option, qui NETTOIE derriere elle si elle faute.
+ *
+ * Indispensable ici : au Level 1 une lecture flash rend ACK=FAULT, ce qui
+ * VERROUILLE le DP par STICKYERR. Sans ce nettoyage, la premiere lecture
+ * refusee ferait echouer toutes les suivantes -- et le rapport dirait que la
+ * data flash et DBGSTOPCR sont illisibles alors que seule la code flash l'est.
+ */
+static bool opt_read(uint32_t addr, uint32_t* out) {
+    if (raiden_swd_mem_read_block(addr, out, 1u)) {
+        return true;
+    }
+    (void)raiden_swd_abort_clear();
+    return false;
+}
+
+void raiden_bat32_opt(void) {
+    uint32_t c0 = 0, c1 = 0, om = 0, dbg = 0;
+    bool has_c0, has_c1, has_om, has_dbg;
+    uint8_t ocden0, ocden1, ocdm, ocden;
+    unsigned bten;
+    bool swap;
+
+    if (raiden_target_family() != RAIDEN_TARGET_BAT32) {
+        rp_err("SWD OPT is implemented for BAT32 only in this binmode "
+               "(TARGET BAT32 first)");
+        return;
+    }
+    if (!raiden_swd_ensure_connected()) {
+        return;
+    }
+
+    has_c0 = opt_read(OPT_CLUSTER0, &c0);
+    has_c1 = opt_read(OPT_CLUSTER1, &c1);
+    has_om = opt_read(OPT_OCDM_BTEN, &om);
+    has_dbg = opt_read(OPT_DBGSTOPCR, &dbg);
+
+    if (!has_c0 && !has_c1 && !has_om && !has_dbg) {
+        // Rien du tout : ce n'est pas une puce protegee, c'est un lien mort.
+        // Les distinguer importe -- au Level 1 la data flash ET DBGSTOPCR
+        // restent lisibles, seule la code flash se ferme.
+        rp_err("SWD OPT read nothing at all (ACK=0x%X) -- suspect the link, "
+               "not the protection: at Level 1 DBGSTOPCR still answers",
+               (unsigned)raiden_swd_last_ack());
+        return;
+    }
+
+    ocden0 = (uint8_t)((c0 >> 24) & 0xFFu);
+    ocden1 = (uint8_t)((c1 >> 24) & 0xFFu);
+    ocdm = (uint8_t)(om & 0xFFu);
+    bten = (unsigned)((om >> 8) & 1u);
+
+    if (has_c0) {
+        rp_printf("Option bytes cluster 0 (0x%08X) = 0x%08X\r\n",
+                  (unsigned)OPT_CLUSTER0, (unsigned)c0);
+        rp_printf("  OCDEN (0x%08X) = 0x%02X\r\n",
+                  (unsigned)(OPT_CLUSTER0 + 3u), (unsigned)ocden0);
+    } else {
+        rp_send("Option bytes cluster 0: unreadable (code flash inaccessible at "
+                "the current protection level)\r\n");
+    }
+    if (has_c1) {
+        rp_printf("Option bytes cluster 1 / boot-swap mirror (0x%08X) = 0x%08X\r\n",
+                  (unsigned)OPT_CLUSTER1, (unsigned)c1);
+        rp_printf("  OCDEN (0x%08X) = 0x%02X\r\n",
+                  (unsigned)(OPT_CLUSTER1 + 3u), (unsigned)ocden1);
+    }
+    if (has_om) {
+        rp_printf("OCDM (0x%08X) = 0x%02X\r\n",
+                  (unsigned)OPT_OCDM_BTEN, (unsigned)ocdm);
+        rp_printf("BTEN (0x%08X) = %u (boot-swap %s)\r\n",
+                  (unsigned)(OPT_OCDM_BTEN + 1u), bten,
+                  (bten == 0u) ? "ACTIVE -- cluster 1 governs, not cluster 0"
+                               : "disabled");
+    } else {
+        rp_send("OCDM/BTEN: unreadable (data flash inaccessible at the current "
+                "protection level)\r\n");
+    }
+    if (has_dbg) {
+        rp_printf("DBGSTOPCR (0x%08X) = 0x%08X  SWDIS=%u (%s)\r\n",
+                  (unsigned)OPT_DBGSTOPCR, (unsigned)dbg,
+                  (unsigned)((dbg & OPT_SWDIS) ? 1u : 0u),
+                  (dbg & OPT_SWDIS) ? "SWD DISABLED by firmware" : "SWD enabled");
+    }
+
+    // Le boot-swap DEPLACE la question : a BTEN=0 c'est le cluster 1 qui
+    // gouverne. Un exemplaire dont le boot-swap est actif a donc sa protection
+    // decidee par un octet que personne ne regarde.
+    swap = has_om && (bten == 0u);
+    if (swap ? !has_c1 : !has_c0) {
+        rp_send("Could not determine protection level (governing option byte "
+                "unreadable)\r\n");
+    } else {
+        ocden = swap ? ocden1 : ocden0;
+        if (ocden != OCDEN_PROTECTED) {
+            rp_printf("Deduced protection level: Level 0 (flash open) "
+                      "(from cluster %u, OCDEN=0x%02X)\r\n",
+                      swap ? 1u : 0u, (unsigned)ocden);
+        } else if (!has_om) {
+            rp_printf("Deduced protection level: Level 1 or 2 -- OCDM unreadable, "
+                      "the two cannot be told apart here (from cluster %u, "
+                      "OCDEN=0x%02X)\r\n", swap ? 1u : 0u, (unsigned)ocden);
+        } else if (ocdm != OCDM_LEVEL2) {
+            rp_printf("Deduced protection level: Level 1 (chip-erase only) "
+                      "(from cluster %u, OCDEN=0x%02X)\r\n",
+                      swap ? 1u : 0u, (unsigned)ocden);
+        } else {
+            rp_printf("Deduced protection level: Level 2 (no flash access via "
+                      "debugger) (from cluster %u, OCDEN=0x%02X)\r\n",
+                      swap ? 1u : 0u, (unsigned)ocden);
+        }
+        if (swap) {
+            rp_printf("  NOTE: boot-swap is ACTIVE -- fault/write target is "
+                      "0x%08X, NOT 0x%08X\r\n",
+                      (unsigned)(OPT_CLUSTER1 + 3u), (unsigned)(OPT_CLUSTER0 + 3u));
+        }
+    }
+
+    // ⚠ Ce que cette ligne ne dit PAS, et le dire ici plutot que dans une doc
+    // que l'operateur n'aura pas sous les yeux : ces octets vivent en code
+    // flash, donc illisibles precisement au Level 1. Ce verdict DECLARE ; seul
+    // le contraste flash/SRAM cote hote MESURE.
+    rp_ok("option bytes read -- declared, not measured");
+}
