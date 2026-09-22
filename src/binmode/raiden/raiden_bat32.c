@@ -396,6 +396,20 @@ static bool opt_read(uint32_t addr, uint32_t* out) {
  * distinguerait ce cas d'un armement qui n'a pas pris. */
 #define OCDEN_IN_CLUSTER 0x03u   /* OCDEN = 4e octet du mot de cluster */
 
+/** Une ecriture de registre du controleur flash : 32 bits, toujours.
+ *
+ * Existe pour que la largeur soit un choix VISIBLE a l'appel plutot qu'un
+ * detail du helper choisi. C'est en la confondant avec la largeur de la donnee
+ * que la sequence d'armement est restee sans effet.
+ */
+static bool fmc_write32(uint32_t addr, uint32_t value) {
+    return raiden_swd_mem_write(addr, &value, 1u);
+}
+
+/* Halter un coeur qui execute du firmware applicatif, pas un coeur deja
+ * arrete : il faut plusieurs requetes. Meme budget que la passe RAMREAD. */
+#define ARM_HALT_MS 500u
+
 #define PROGRAM_POLL_MS 2u
 #define PROGRAM_TRIES   50u
 
@@ -469,14 +483,45 @@ static void cmd_arm(int argc, char* argv[]) {
         return;
     }
 
-    /* Unlock, then the PROGRAM key pair, then the byte itself. The byte write
-     * is 8-bit on purpose: OCDEN shares its 32-bit word with the WDT, LVD and
-     * HOCO option bytes, and a word write would take all four. */
-    if (!raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_UNLOCK) ||
-        !raiden_swd_mem_write_byte(FL_FLOPMD1, FLOPMD1_PROGRAM) ||
-        !raiden_swd_mem_write_byte(FL_FLOPMD2, FLOPMD2_PROGRAM) ||
+    /* ⚠⚠ Nettoyer STICKYERR AVANT toute chose. Une lecture d'octet d'option
+     * qui a faute -- SWD OPT sur une piece partiellement illisible, ou le
+     * sondage qui precede -- verrouille le DP, et TOUTE transaction AP
+     * suivante echoue. La sequence ci-dessous echouerait alors pour une raison
+     * qui n'a rien a voir avec le controleur flash. */
+    (void)raiden_swd_abort_clear();
+
+    /* ⚠⚠ Halter le coeur, et REFUSER s'il ne s'arrete pas. Le driver du
+     * fondeur s'execute depuis la RAM, interruptions coupees, precisement
+     * parce que le CPU ne doit pas aller chercher ses instructions dans un
+     * flash qu'on programme. Par SWD, l'equivalent est un coeur halte -- sans
+     * quoi le firmware de la cible continue de s'executer dans le tableau
+     * qu'on ecrit. Un refus ici coute un message ; passer outre coute une
+     * piece a moitie programmee. */
+    if (!raiden_swd_halt(ARM_HALT_MS, NULL)) {
+        rp_err("Core halt failed: refusing to program an option byte while the "
+               "CPU is fetching from the array being written");
+        return;
+    }
+
+    /* ⚠⚠ Les registres du controleur flash s'ecrivent en 32 BITS, seul l'octet
+     * de donnee passe en largeur octet.
+     *
+     * Ils etaient tous les quatre ecrits en octet jusqu'au 2026-09-22, et c'est
+     * la panne qui a fait rendre "the write did not take" a chaque tentative :
+     * un registre peripherique qui n'accepte que le mot IGNORE une ecriture
+     * d'octet, sans fauter. Le bus acquitte, FLPROT ne deverrouille jamais,
+     * l'octet n'est pas programme -- et rien dans la reponse ne le dit.
+     * Le firmware raiden ecrit bien ces quatre-la en mem_write32 et reserve
+     * mem_write8 a la donnee (src/swd.c, swd_bat32_flash_program).
+     *
+     * L'octet de donnee, lui, DOIT rester en largeur octet : OCDEN partage son
+     * mot de 32 bits avec les octets d'option WDT, LVD et HOCO, et une
+     * ecriture de mot les emporterait tous les quatre. */
+    if (!fmc_write32(FL_FLPROT, FLPROT_UNLOCK) ||
+        !fmc_write32(FL_FLOPMD1, FLOPMD1_PROGRAM) ||
+        !fmc_write32(FL_FLOPMD2, FLOPMD2_PROGRAM) ||
         !raiden_swd_mem_write_byte(ocden_addr, OCDEN_PROTECTED)) {
-        (void)raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_RELOCK);
+        (void)fmc_write32(FL_FLPROT, FLPROT_RELOCK);
         rp_err("Option-byte write sequence failed on the bus -- OCDEN may be "
                "unchanged OR half-written. Read it back with SWD OPT before doing "
                "anything else");
@@ -494,8 +539,8 @@ static void cmd_arm(int argc, char* argv[]) {
     }
 
     /* Leave the flash controller as the vendor driver does, whatever happened. */
-    (void)raiden_swd_mem_write_byte(FL_FLERMD, 0x00u);
-    (void)raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_RELOCK);
+    (void)fmc_write32(FL_FLERMD, 0x00u);
+    (void)fmc_write32(FL_FLPROT, FLPROT_RELOCK);
 
     if (!armed) {
         rp_err("OCDEN at 0x%08X still 0x%02X after %u ms: the write did not take",
