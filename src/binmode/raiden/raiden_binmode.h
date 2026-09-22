@@ -1,3 +1,11 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Thaolia
+ *
+ * Written for the Bus Pirate 5 firmware (MIT, (c) 2023 Ian Lesnet, Where Labs
+ * LLC). Independent reimplementation of a command surface -- no code was copied
+ * from the project whose dialect it speaks; that project ships no licence.
+ */
 /**
  * @file raiden_binmode.h
  * @brief Binary mode speaking the raiden-pico command dialect.
