@@ -142,8 +142,12 @@ static bool run_payload(uint32_t src, uint32_t words) {
     // passes on exactly the corruption it did not sample.
     memset(check, 0, sizeof(check));
     if (!raiden_swd_mem_read_block(PAYLOAD_ADDR, check, PAYLOAD_WORDS)) {
-        rp_printf("[BAT32-RAM] payload readback mismatch (%08X %08X)\r\n",
-                  0u, 0u);
+        // Its OWN message. Reporting this as a "mismatch" with two zeros would
+        // send the reader after a memory that kept the wrong bytes, when what
+        // actually happened is that the link died between the write and the
+        // read -- two different benches to go and look at.
+        rp_printf("[BAT32-RAM] payload readback failed -- the SRAM took the "
+                  "write but did not answer the read\r\n");
         return false;
     }
     for (uint32_t i = 0; i < PAYLOAD_WORDS; i++) {
