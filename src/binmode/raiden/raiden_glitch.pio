@@ -1,0 +1,90 @@
+;
+; raiden_glitch.pio -- one-shot voltage-glitch engine for the raiden dialect.
+;
+; One state machine on PIO_MODE_PIO: wait for the trigger edge, delay loop,
+; assert the crowbar gate, width loop, deassert, then publish a witness word.
+;
+; The clock divider is 1.0 (set in raiden_glitch.c), so ONE INSTRUCTION IS ONE
+; clk_sys CYCLE and a PAUSE unit is a clk_sys cycle at any frequency. Nothing
+; here hard-codes a frequency: commands/uart/glitch.pio divides down to 100 MHz
+; and throws away resolution, and the upstream raiden firmware freezes
+; 150000000.0f in its decoder, which silently detunes it by 20 % the day the
+; clock moves. Neither mistake is repeated here.
+;
+; Two programs, identical but for the two `wait` lines. raiden_glitch.c keeps
+; only ONE of them resident at a time, so PIO instruction memory stays at 16 of
+; 32. Both would still fit -- the point is the headroom: two resident programs
+; fill the instance exactly, and any other user of PIO_MODE_PIO could then load
+; nothing at all.
+;
+; ENTRY POINTS. Each program has two:
+;   armed: the wrap target -- pulls PAUSE and WIDTH, then waits for the edge.
+;   now:   the same pulse, with no wait at all, for the manual GLITCH command.
+; `now` sits BEFORE .wrap_target on purpose. After any shot the state machine
+; wraps to `armed`, i.e. to the entry that waits for an edge. Wrapping to `now`
+; instead would leave a loaded gun: any path that re-enabled the SM or re-pushed
+; parameters without setting the PC would fire instantly, and in a campaign that
+; reads as a working trigger while every shot went out at the wrong instant.
+;
+; WHY THE FIRST `wait` IS LOAD-BEARING. The host arms and only then cuts the
+; target's power (campaign.py Bench.shoot()), so at ARM ON the rail -- and with
+; it BIO1 -- is still HIGH. A lone `wait 1 pin 0` would be satisfied by that
+; standing level and fire immediately, before the power cycle. Requiring a
+; stable LOW first turns a level test into an edge test.
+;
+; The trailing `push noblock` is the fire witness: a word in the RX FIFO means
+; the program reached its end, so the pulse physically went out. An empty TX
+; FIFO could NOT serve -- both `pull`s drain at ARM time, before the trigger.
+
+.program raiden_glitch_rising
+
+public now:                     ; manual entry: no trigger, fire on enable
+    pull block
+    mov x, osr
+    pull block
+    mov y, osr
+    jmp delay                   ; costs one cycle, but only on the manual path
+
+.wrap_target
+public armed:
+    pull block                  ; PAUSE -- latched BEFORE the edge, never after
+    mov x, osr
+    pull block                  ; WIDTH
+    mov y, osr
+    wait 0 pin 0                ; require a stable low: this is the edge detector
+    wait 1 pin 0                ; the rising edge itself
+delay:
+    jmp x-- delay               ; one clk_sys cycle per PAUSE unit
+    set pins, 1                 ; assert the gate (pad inverted for an active-low gate)
+width:
+    jmp y-- width               ; one clk_sys cycle per WIDTH unit
+    set pins, 0                 ; deassert
+    push noblock                ; fire witness -- see header
+.wrap
+
+
+.program raiden_glitch_falling
+
+public now:
+    pull block
+    mov x, osr
+    pull block
+    mov y, osr
+    jmp delay
+
+.wrap_target
+public armed:
+    pull block
+    mov x, osr
+    pull block
+    mov y, osr
+    wait 1 pin 0                ; require a stable high first
+    wait 0 pin 0                ; the falling edge itself
+delay:
+    jmp x-- delay
+    set pins, 1
+width:
+    jmp y-- width
+    set pins, 0
+    push noblock
+.wrap

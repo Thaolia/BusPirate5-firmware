@@ -532,6 +532,21 @@ set(buspirate_common
 
         # binary mode
         binmode/binmodes.c
+        binmode/raiden/raiden_binmode.c
+        binmode/raiden/raiden_binmode.h
+        binmode/raiden/raiden_proto.c
+        binmode/raiden/raiden_proto.h
+        binmode/raiden/raiden_clock.c
+        binmode/raiden/raiden_clock.h
+        binmode/raiden/raiden_cmd.h
+        binmode/raiden/raiden_power.c
+        binmode/raiden/raiden_power.h
+        binmode/raiden/raiden_swd.c
+        binmode/raiden/raiden_swd.h
+        binmode/raiden/raiden_ctrlap.c
+        binmode/raiden/raiden_ctrlap.h
+        binmode/raiden/raiden_glitch.c
+        binmode/raiden/raiden_glitch.h
         binmode/binmodes.h
         binmode/binio_helpers.c
         binmode/binio_helpers.h
@@ -820,6 +835,7 @@ foreach(revision ${revisions})
         pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/pirate/hwuart.pio)  
         pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/pirate/spisnif.pio)  
         pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/binmode/logicanalyzer.pio)
+        pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/binmode/raiden/raiden_glitch.pio)
         pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/lib/pico_ir_nec/nec_carrier_burst.pio)
         pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/lib/pico_ir_nec/nec_carrier_control.pio)
         pico_generate_pio_header(${revision} ${CMAKE_CURRENT_LIST_DIR}/lib/pico_ir_nec/nec_receive.pio)

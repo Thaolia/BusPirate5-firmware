@@ -33,6 +33,7 @@
 #include "binmode/falaio.h"
 #include "binmode/irtoy-irman.h"
 #include "binmode/irtoy-air.h"
+#include "binmode/raiden/raiden_binmode.h"
 #include "lib/arduino-ch32v003-swio/arduino_ch32v003.h"
 #include "pirate/storage.h" // File system related
 #include "usb_rx.h"
@@ -176,6 +177,26 @@ const binmode_t binmodes[] = {
         .binmode_setup = irtoy_air_setup,
         .binmode_cleanup = irtoy_air_cleanup,
         .binmode_service = irtoy_air_service,
+    },
+    {
+        // Le terminal reste utilisable : c'est par lui qu'on quitte le mode
+        // (`binmode 0`), et aucune touche parasite ne doit faire sortir d'une
+        // campagne en cours -- d'ou button_to_exit a false.
+        .lock_terminal = false,
+        .can_save_config = true,
+        .reset_to_hiz = true,
+        .pullup_enabled = false,
+        // 0 : le PPSU est pilote par TARGET POWER, jamais arme automatiquement.
+        // Mettre la cible sous tension a l'entree du mode la ferait demarrer
+        // avant que le crowbar et le trigger soient dans un etat connu.
+        .psu_en_voltage = 0,
+        .psu_en_current = 0,
+        .button_to_exit = false,
+        .binmode_name = raiden_binmode_name,
+        .binmode_setup = raiden_binmode_setup,
+        .binmode_setup_message = raiden_binmode_setup_message,
+        .binmode_service = raiden_binmode_service,
+        .binmode_cleanup = raiden_binmode_cleanup,
     },
 };
 
