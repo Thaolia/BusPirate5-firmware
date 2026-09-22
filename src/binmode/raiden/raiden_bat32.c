@@ -135,6 +135,24 @@ static bool run_payload(uint32_t src, uint32_t words) {
         return false;
     }
 
+    // Emise ICI, et nulle part plus haut. Avant cette ligne rien n'a ete ecrit
+    // dans la cible, et une note posee des l'entree de la commande affirmerait
+    // un ecrasement qui n'a pas eu lieu : une passe qui echoue au halt laisse
+    // le .data intact. Or ce .data EST le repli qu'on vient chercher quand le
+    // contournement rate -- faire croire qu'il est perdu couterait precisement
+    // la chose qu'on essayait de sauver.
+    //
+    // Une fois par session, pas par passe : un dump en fait des centaines, et
+    // une note repetee cesse d'etre lue.
+    if (!sram_notice_shown) {
+        sram_notice_shown = true;
+        rp_printf("[BAT32-RAM] NOTE: payload written to target SRAM -- "
+                  "0x%08X-0x%08X no longer holds the .data copied from flash at "
+                  "boot. A reset restores about 93 %% of it.\r\n",
+                  (unsigned)PAYLOAD_ADDR,
+                  (unsigned)(PAYLOAD_BUF + 4u * RAMREAD_MAX_WORDS - 1u));
+    }
+
     // Read the copier back before running it. An SRAM that accepted the write
     // and kept something else would run whatever it kept, and the failure
     // would surface as "did not reach BKPT" -- pointing at the mechanism
@@ -281,14 +299,6 @@ static void cmd_ramread(int argc, char* argv[]) {
     }
     if (!raiden_swd_ensure_connected()) {
         return; // ensure_connected() has already said why
-    }
-
-    if (!sram_notice_shown) {
-        sram_notice_shown = true;
-        rp_printf("[BAT32-RAM] NOTE: this overwrites target SRAM 0x%08X-0x%08X, "
-                  "where the .data copied from flash at boot lives. A reset "
-                  "restores about 93 %% of it.\r\n",
-                  (unsigned)PAYLOAD_ADDR, (unsigned)(PAYLOAD_BUF + 4u * RAMREAD_MAX_WORDS - 1u));
     }
 
     if (!run_payload(src, words)) {
