@@ -99,10 +99,44 @@ static void cmd_status(void) {
     raiden_target_status();
 }
 
+static void cmd_help(void) {
+    rp_send("=== Bus Pirate raiden-dialect binmode ===\r\n\r\n");
+    rp_send("VERSION                  - dialect version, clock, glitch step\r\n");
+    rp_send("STATUS                   - full bench state (glitch, power, target)\r\n");
+    rp_send("HELP | ?                 - this list\r\n\r\n");
+    rp_send("-- SWD --\r\n");
+    rp_send("SWD CONNECT | IDCODE | HALT | SPEED <n>\r\n");
+    rp_send("SWD READ <addr> [words]  - read via the debugger\r\n");
+    rp_send("SWD WRITE <addr> <word>\r\n");
+    rp_send("SWD BAT32 <op>           - BAT32-only operations; SWD BAT32 for its help\r\n\r\n");
+    rp_send("-- TARGET --\r\n");
+    rp_send("TARGET NRF52 | BAT32     - select the family FIRST; nothing else works before\r\n");
+    rp_send("TARGET RESET             - pin reset (rearms the debug port on BAT32 ONLY)\r\n");
+    rp_send("TARGET POWER ON [<mV> [<mA> [<uv%>]]] | OFF | CYCLE [<ms>]\r\n");
+    rp_send("TARGET POWER SOURCE PSU | MOSFET <AHIGH|ALOW>\r\n");
+    rp_send("TARGET POWER EXTERNAL [AHIGH|ALOW] | INTERNAL\r\n");
+    rp_send("  NOTE: SOURCE sets NEITHER voltage NOR current -- it only picks the\r\n");
+    rp_send("  supply and PRINTS the current setting. Values live on POWER ON,\r\n");
+    rp_send("  in INTEGER millivolts: 2200, never 2.2\r\n\r\n");
+    rp_send("-- GLITCH --\r\n");
+    rp_send("SET PAUSE <cycles> | SET WIDTH <cycles> | GET\r\n");
+    rp_send("ARM [ON|OFF|TRACE] | GLITCH | TRIGGER GPIO <edge> | TRIGGER NONE\r\n");
+    rp_send("TRACE <n> <pre%> | TRACE STATUS | TRACE DUMP | TRACE RESET\r\n\r\n");
+    rp_send("-- WHAT THIS BINMODE DOES NOT DO --\r\n");
+    rp_send("  It is a SECOND bench, not a replacement for the raiden: it refines a\r\n");
+    rp_send("  window already found. See docs/BP5_FACTS.md for why their cycles are\r\n");
+    rp_send("  not interchangeable.\r\n");
+}
+
 static void dispatch(int argc, char* argv[]) {
     const char* verb = argv[0];
 
-    if (strcmp(verb, "VERSION") == 0) {
+    if (strcmp(verb, "HELP") == 0 || strcmp(verb, "?") == 0) {
+        // ⚠ A bench one cannot interrogate is a bench one guesses at. The list
+        // below is the ONLY place that states what this binmode serves, and it
+        // must be updated in the same change as any verb added or removed.
+        cmd_help();
+    } else if (strcmp(verb, "VERSION") == 0) {
         cmd_version();
     } else if (strcmp(verb, "STATUS") == 0) {
         cmd_status();

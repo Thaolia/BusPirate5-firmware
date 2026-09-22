@@ -135,6 +135,10 @@ bool raiden_swd_mem_read_block(uint32_t addr, uint32_t* buf, uint32_t nwords);
  */
 bool raiden_swd_mem_write(uint32_t addr, const uint32_t* values, uint32_t nwords);
 
+/** Write ONE byte. Required for the BAT32 option bytes, which share a 32-bit
+ *  word with the WDT/LVD/HOCO settings -- a word write would clobber them. */
+bool raiden_swd_mem_write_byte(uint32_t addr, uint8_t value);
+
 /** Read or write one core register through DCRSR+DCRDR. Core must be halted. */
 bool raiden_swd_core_reg_read(uint8_t regsel, uint32_t* out);
 bool raiden_swd_core_reg_write(uint8_t regsel, uint32_t value);

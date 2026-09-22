@@ -68,6 +68,12 @@
  * coincidence of the Cortex-M default Prot field and nothing more -- do not
  * read one as evidence about the other. */
 #define AP_CSW_WORD_INC 0x23000012u
+/* Size=000 (byte), AddrInc=00 (off). Same DbgSwEnable/Prot bits as the word
+ * variant -- only the access size and the auto-increment differ. A byte write
+ * exists for ONE reason: the BAT32 option bytes share a 32-bit word with the
+ * WDT, LVD and HOCO settings, so writing OCDEN as a word would silently
+ * overwrite three unrelated configurations on the very part being locked. */
+#define AP_CSW_BYTE 0x23000000u
 
 /* TAR auto-increment is only guaranteed inside a 1 KB window (ADIv5): past it
  * the increment may wrap instead of carrying, so TAR is rewritten at every
@@ -654,6 +660,38 @@ static bool mem_write_block(uint32_t addr, const uint32_t* values, uint32_t nwor
 /** Single-word memory write: the halt request, and the core-debug registers. */
 static bool mem_write_word(uint32_t addr, uint32_t value) {
     return mem_write_block(addr, &value, 1u);
+}
+
+/** Single-BYTE memory write. See AP_CSW_BYTE for why this exists at all.
+ *
+ * ADIv5 routes a sub-word access through the byte lane selected by the low
+ * address bits, so the value is shifted into its lane before the DRW write.
+ * Getting that shift wrong writes the right byte to the wrong quarter of the
+ * word -- which, on an option byte, is indistinguishable from a part that
+ * refused the write.
+ */
+bool raiden_swd_mem_write_byte(uint32_t addr, uint8_t value) {
+    uint32_t csw = AP_CSW_BYTE;
+    uint32_t tar = addr;
+    uint32_t drw = (uint32_t)value << (8u * (addr & 3u));
+    uint32_t rdbuff = 0;
+
+    if (!raiden_swd_power_up_debug(NULL)) {
+        return false;
+    }
+    if (!ap_select(0u, AP_CSW)) {
+        return false;
+    }
+    if (!swd_xfer(true, false, AP_CSW, &csw)) {
+        return false;
+    }
+    if (!swd_xfer(true, false, AP_TAR, &tar)) {
+        return false;
+    }
+    if (!swd_xfer(true, false, AP_DRW, &drw)) {
+        return false;
+    }
+    return dp_read(DP_RDBUFF, &rdbuff);
 }
 
 /* --- The seam the target-family modules use -------------------------- *

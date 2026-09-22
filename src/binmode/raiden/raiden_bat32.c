@@ -339,13 +339,127 @@ static void cmd_ramread(int argc, char* argv[]) {
     rp_ok("%u words read via core payload", (unsigned)words);
 }
 
+
+/* --- Option-byte programming ------------------------------------------
+ *
+ * Registers and key values come from the BAT32G135 User Manual section 29.4 as
+ * transcribed in the host project's docs/07_BAT32G135_FAULTYCAT.md. Nothing was
+ * copied from the raiden-pico firmware, which carries no licence file.
+ *
+ * The PROGRAM key order (FLOPMD1 <- 0xAA then FLOPMD2 <- 0x55) is the REVERSE
+ * of the erase order. Swapping them does not fail loudly: the part simply does
+ * not program, which reads as a chip that refused.
+ */
+#define FL_FLSTS        0x40020000u
+#define FL_FLOPMD1      0x40020004u
+#define FL_FLOPMD2      0x40020008u
+#define FL_FLERMD       0x4002000Cu
+#define FL_FLPROT       0x40020020u
+
+#define FLPROT_UNLOCK   0xF1u   /* PRKEY[7:1]=0x78 + WRP=1                  */
+#define FLPROT_RELOCK   0xF0u   /* what the vendor driver leaves behind     */
+#define FLOPMD1_PROGRAM 0xAAu
+#define FLOPMD2_PROGRAM 0x55u
+
+/* OCDEN, cluster 0 -- the one consulted while BTEN=1, its power-on default.
+ * The boot-swap cluster (0x000001C3) is NOT handled here: this binmode has no
+ * way to read BTEN back, and arming the wrong cluster would leave a part that
+ * looks unlocked while a second copy of the byte says otherwise. */
+#define OCDEN_ADDR      0x000000C3u
+#define OCDEN_PROTECTED 0xC3u
+
+#define OCDEN_WORD      (OCDEN_ADDR & ~3u)
+#define OCDEN_LANE      (OCDEN_ADDR & 3u)
+#define PROGRAM_POLL_MS 2u
+#define PROGRAM_TRIES   50u
+
+/** Read OCDEN back. The word read is masked down to its byte lane. */
+static bool ocden_read(uint8_t* out) {
+    uint32_t word = 0;
+    if (!raiden_swd_mem_read_block(OCDEN_WORD, &word, 1u)) {
+        return false;
+    }
+    *out = (uint8_t)((word >> (8u * OCDEN_LANE)) & 0xFFu);
+    return true;
+}
+
+/** SWD BAT32 ARM CONFIRM -- OCDEN 0xFF -> 0xC3, i.e. protection Level 1.
+ *
+ * ⚠⚠ IRREVERSIBLE without a chip erase. Once OCDEN reads 0xC3 the code flash is
+ * unreadable through the debugger, and the ONLY way back is CHIPERASE -- which
+ * this binmode does not implement. Dump and VERIFY the dump first: the plaintext
+ * of the application exists nowhere else.
+ *
+ * ⚠ Completion is confirmed by READING OCDEN BACK, not by polling FLSTS.OVF.
+ * The host project documents OVF by name but not by bit position, and inventing
+ * a mask would be exactly the kind of unsourced constant this bench refuses. A
+ * read-back proves the outcome rather than a status bit's meaning.
+ */
+static void cmd_arm(int argc, char* argv[]) {
+    if (argc < 4 || strcmp(argv[argc - 1], "CONFIRM") != 0) {
+        rp_err("SWD BAT32 ARM is destructive and requires a literal CONFIRM as the "
+               "last token. It sets Level 1; only a chip erase undoes it, and this "
+               "binmode has no chip erase");
+        return;
+    }
+
+    uint8_t before = 0;
+    if (!ocden_read(&before)) {
+        rp_err("Cannot read OCDEN: the debug port is not answering. Refusing to "
+               "program an option byte blind");
+        return;
+    }
+    if (before == OCDEN_PROTECTED) {
+        rp_ok("OCDEN already 0xC3 (Level 1) -- nothing to do");
+        return;
+    }
+
+    /* Unlock, then the PROGRAM key pair, then the byte itself. The byte write
+     * is 8-bit on purpose: OCDEN shares its 32-bit word with the WDT, LVD and
+     * HOCO option bytes, and a word write would take all four. */
+    if (!raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_UNLOCK) ||
+        !raiden_swd_mem_write_byte(FL_FLOPMD1, FLOPMD1_PROGRAM) ||
+        !raiden_swd_mem_write_byte(FL_FLOPMD2, FLOPMD2_PROGRAM) ||
+        !raiden_swd_mem_write_byte(OCDEN_ADDR, OCDEN_PROTECTED)) {
+        (void)raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_RELOCK);
+        rp_err("Option-byte write sequence failed on the bus -- OCDEN may be "
+               "unchanged OR half-written. Read it back before doing anything else");
+        return;
+    }
+
+    uint8_t after = 0;
+    bool armed = false;
+    for (uint32_t i = 0; i < PROGRAM_TRIES; i++) {
+        busy_wait_ms(PROGRAM_POLL_MS);
+        if (ocden_read(&after) && after == OCDEN_PROTECTED) {
+            armed = true;
+            break;
+        }
+    }
+
+    /* Leave the flash controller as the vendor driver does, whatever happened. */
+    (void)raiden_swd_mem_write_byte(FL_FLERMD, 0x00u);
+    (void)raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_RELOCK);
+
+    if (!armed) {
+        rp_err("OCDEN still 0x%02X after %u ms: the write did not take", (unsigned)after,
+               (unsigned)(PROGRAM_TRIES * PROGRAM_POLL_MS));
+        return;
+    }
+    rp_ok("OCDEN 0x%02X -> 0xC3, protection Level 1 (effective at the next reset)",
+          (unsigned)before);
+}
+
 static void cmd_help(void) {
     rp_send("SWD BAT32 RAMREAD <addr> [words] - read flash VIA the core (L1 bypass)\r\n");
     rp_send("  RAMREAD is read-only on FLASH but OVERWRITES target SRAM "
             "0x20000000-0x2000101F\r\n");
-    rp_send("  The destructive verbs of this dialect -- PROGRAM, WRITE, PATTERN,\r\n");
-    rp_send("  SECTORERASE, CHIPERASE, ARM, DISARM -- are DELIBERATELY not\r\n");
-    rp_send("  implemented here. Arming or recovering a Level 1 needs the raiden.\r\n");
+    rp_send("SWD BAT32 ARM CONFIRM    - OCDEN 0xFF->0xC3 = protection Level 1\r\n");
+    rp_send("  IRREVERSIBLE here: only a chip erase undoes it, and this binmode\r\n");
+    rp_send("  has none. Dump and VERIFY the dump first.\r\n");
+    rp_send("  The other destructive verbs -- PROGRAM, WRITE, PATTERN,\r\n");
+    rp_send("  SECTORERASE, CHIPERASE, DISARM -- are DELIBERATELY not\r\n");
+    rp_send("  implemented here. Recovering a Level 1 needs the raiden.\r\n");
 }
 
 void raiden_bat32_command(int argc, char* argv[]) {
@@ -364,6 +478,10 @@ void raiden_bat32_command(int argc, char* argv[]) {
         cmd_ramread(argc, argv);
         return;
     }
-    rp_err("Unknown SWD BAT32 operation '%s' (this binmode implements RAMREAD "
-           "only; the destructive verbs are deliberately absent)", argv[2]);
+    if (strcmp(argv[2], "ARM") == 0) {
+        cmd_arm(argc, argv);
+        return;
+    }
+    rp_err("Unknown SWD BAT32 operation '%s' (this binmode implements RAMREAD and "
+           "ARM; the other destructive verbs are deliberately absent)", argv[2]);
 }
