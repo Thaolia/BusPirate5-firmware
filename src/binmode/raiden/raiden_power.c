@@ -372,16 +372,15 @@ void raiden_power_command(int argc, char* argv[]) {
         rp_err("Usage: TARGET POWER <ON|OFF|CYCLE|EXTERNAL|INTERNAL|SOURCE>");
         return;
     }
-    if (strcmp(argv[1], "POWER") == 0) {
-        cmd_power(argc, argv);
+    // raiden_target.c routes TARGET and only forwards POWER here; anything
+    // else it refuses by name. Kept as an assertion rather than as a second
+    // opinion: two modules answering for the same verb is how they drift.
+    if (strcmp(argv[1], "POWER") != 0) {
+        rp_err("TARGET %s did not belong to raiden_power (internal routing bug)",
+               argv[1]);
         return;
     }
-    // Everything else raiden's TARGET verb accepts -- RESET, SYNC, BL, the
-    // chip-family selectors -- is out of scope here. Say so instead of
-    // accepting it: a TARGET RESET that silently did nothing would look like a
-    // reset that failed to open the chip.
-    rp_err("TARGET %s is not implemented in the raiden binmode (only TARGET POWER)",
-           argv[1]);
+    cmd_power(argc, argv);
 }
 
 void raiden_power_status(void) {

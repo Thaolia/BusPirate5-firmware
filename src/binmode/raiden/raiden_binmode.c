@@ -23,8 +23,10 @@
 
 #include "raiden_binmode.h"
 #include "raiden_clock.h"
+#include "raiden_bat32.h"
 #include "raiden_cmd.h"
 #include "raiden_proto.h"
+#include "raiden_target.h"
 
 #define RAIDEN_VERSION "v0.1-bp5"
 
@@ -71,6 +73,13 @@ bool raiden_parse_u32(const char* s, uint32_t* out) {
     return true;
 }
 
+bool raiden_parse_hex32(const char* s, uint32_t* out) {
+    if (s == NULL || s[0] != '0' || (s[1] != 'X' && s[1] != 'x')) {
+        return false;
+    }
+    return raiden_parse_u32(s, out);
+}
+
 static void cmd_version(void) {
     rp_printf("Bus Pirate raiden-dialect binmode %s\r\n", RAIDEN_VERSION);
     // The clock is half the meaning of any PAUSE or WIDTH in a campaign log:
@@ -87,6 +96,7 @@ static void cmd_status(void) {
               (unsigned)(raiden_clock_hz() / 1000u), (unsigned)raiden_clock_step_ps());
     raiden_glitch_status();
     raiden_power_status();
+    raiden_target_status();
 }
 
 static void dispatch(int argc, char* argv[]) {
@@ -99,7 +109,7 @@ static void dispatch(int argc, char* argv[]) {
     } else if (strcmp(verb, "SWD") == 0) {
         raiden_swd_command(argc, argv);
     } else if (strcmp(verb, "TARGET") == 0) {
-        raiden_power_command(argc, argv);
+        raiden_target_command(argc, argv);
     } else if (strcmp(verb, "SET") == 0 || strcmp(verb, "GET") == 0 ||
                strcmp(verb, "ARM") == 0 || strcmp(verb, "GLITCH") == 0 ||
                strcmp(verb, "TRIGGER") == 0 || strcmp(verb, "TRACE") == 0) {
@@ -183,6 +193,8 @@ void raiden_binmode_setup(void) {
     system_config.binmode_usb_rx_queue_enable = true;
     system_config.binmode_usb_tx_queue_enable = true;
     raiden_clock_apply();
+    raiden_target_init();
+    raiden_bat32_init();
     raiden_power_init();
     raiden_swd_init();
     raiden_glitch_init();

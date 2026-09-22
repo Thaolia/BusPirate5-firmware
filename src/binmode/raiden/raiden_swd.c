@@ -36,6 +36,7 @@
 #include "system_config.h"
 #include "pirate/bio.h"
 
+#include "raiden_bat32.h"
 #include "raiden_cmd.h"
 #include "raiden_ctrlap.h"
 #include "raiden_proto.h"
@@ -77,7 +78,35 @@
 #define CM_CPUID 0xE000ED00u
 #define CM_DHCSR 0xE000EDF0u
 #define DHCSR_HALT_REQ 0xA05F0003u /* DBGKEY | C_DEBUGEN | C_HALT */
+#define DHCSR_RESUME_REQ 0xA05F0001u /* DBGKEY | C_DEBUGEN, C_HALT cleared */
 #define DHCSR_S_HALT (1u << 17)
+#define DHCSR_S_REGRDY (1u << 16)
+#define DHCSR_S_RESET_ST (1u << 25)
+
+/* A value that cannot BE a DHCSR: bits 4-15 and 28-31 are reserved and read as
+ * zero on every Cortex-M. 0xFFFFFFFF from a floating line trips it, and so does
+ * the 0x23000000 a disabled AHB-AP returns. A genuine LOCKUP reading,
+ * 0x01080001, does NOT -- that one is a real answer and has to stay readable,
+ * because it is the difference between "this core died" and "this bus is not
+ * there", and the BAT32 payload path reports the two differently. */
+#define DHCSR_IMPLAUSIBLE 0xF000FFF0u
+
+#define CM_DCRSR 0xE000EDF4u
+#define CM_DCRDR 0xE000EDF8u
+#define DCRSR_WRITE (1u << 16)
+
+/* S_REGRDY after a DCRSR access. The ARM ARM gives no bound; a halted core
+ * completes the transfer in a few cycles, so this is already generous. */
+#define REGRDY_TRIES 40u
+#define REGRDY_POLL_US 50u
+
+#define HALT_POLL_US 200u
+
+/* Timeout of the CLI halt. A running core stops in microseconds; this only has
+ * to cover a part still coming out of reset. The BAT32 payload path asks for
+ * ten times more, because there it halts a core executing application firmware
+ * -- and asks for it explicitly rather than raising this one for everybody. */
+#define HALT_CLI_TIMEOUT_MS 50u
 
 /* --- Line-level sequences -------------------------------------------- */
 #define SWD_JTAG_TO_SWD 0xE79Eu
@@ -110,6 +139,8 @@
  * a cooperative main loop: 64 words would emit ~1.3 KB in one burst with no
  * bit-banging pause to drain it. */
 #define MEM_BLOCK_WORDS 16u
+_Static_assert(MEM_BLOCK_WORDS == RAIDEN_MEM_BLOCK_WORDS,
+               "the header's block size must match the one reasoned about here");
 
 /* 1 MiB of words: the largest nRF52 flash. A count beyond this is a typo, and
  * a typo that reads for an hour looks exactly like a hung bench. */
@@ -590,9 +621,8 @@ static bool mem_read_block(uint32_t addr, uint32_t* buf, uint32_t nwords) {
     return dp_read(DP_RDBUFF, &buf[nwords - 1u]);
 }
 
-/** Single-word memory write. No command exposes this: it exists for the halt
- * request alone. This bench reads a target, it does not modify one. */
-static bool mem_write_word(uint32_t addr, uint32_t value) {
+/** Memory write of one TAR window's worth. @p nwords must fit the window. */
+static bool mem_write_block(uint32_t addr, const uint32_t* values, uint32_t nwords) {
     uint32_t csw = AP_CSW_WORD_INC;
     uint32_t tar = addr;
     uint32_t rdbuff = 0;
@@ -609,10 +639,153 @@ static bool mem_write_word(uint32_t addr, uint32_t value) {
     if (!swd_xfer(true, false, AP_TAR, &tar)) {
         return false;
     }
-    if (!swd_xfer(true, false, AP_DRW, &value)) {
+    for (uint32_t i = 0; i < nwords; i++) {
+        uint32_t v = values[i]; // swd_xfer takes a mutable slot even to write
+        if (!swd_xfer(true, false, AP_DRW, &v)) {
+            return false;
+        }
+    }
+    // RDBUFF flushes the last posted write. Without it a write that faulted
+    // would surface on whatever transaction came next -- reported against the
+    // wrong address, which reads as a second, unrelated failure.
+    return dp_read(DP_RDBUFF, &rdbuff);
+}
+
+/** Single-word memory write: the halt request, and the core-debug registers. */
+static bool mem_write_word(uint32_t addr, uint32_t value) {
+    return mem_write_block(addr, &value, 1u);
+}
+
+/* --- The seam the target-family modules use -------------------------- *
+ *
+ * Thin by design. A family module never sees a DP register, an APSEL or a CSW
+ * field: it asks for memory, core registers, a halt or a resume. That is what
+ * lets raiden_bat32.c be read for what it does to a BAT32 rather than for how
+ * it drives ADIv5, and it is the only reason two families can share this file
+ * without either one growing its own private variant of a transaction.
+ */
+
+bool raiden_swd_ensure_connected(void) {
+    return ensure_connected();
+}
+
+bool raiden_swd_abort_clear(void) {
+    return swd_abort_clear();
+}
+
+uint32_t raiden_swd_block_words(uint32_t addr, uint32_t remaining) {
+    return block_words(addr, remaining);
+}
+
+bool raiden_swd_mem_read_block(uint32_t addr, uint32_t* buf, uint32_t nwords) {
+    return mem_read_block(addr, buf, nwords);
+}
+
+bool raiden_swd_mem_write(uint32_t addr, const uint32_t* values, uint32_t nwords) {
+    uint32_t done = 0;
+    while (done < nwords) {
+        uint32_t at = addr + done * 4u;
+        uint32_t n = block_words(at, nwords - done);
+        if (!mem_write_block(at, &values[done], n)) {
+            return false;
+        }
+        done += n;
+    }
+    return true;
+}
+
+bool raiden_swd_read_dhcsr(uint32_t* out) {
+    return mem_read_block(CM_DHCSR, out, 1u);
+}
+
+/** Wait for the core to finish a DCRSR transfer. */
+static bool wait_regrdy(void) {
+    for (uint32_t i = 0; i < REGRDY_TRIES; i++) {
+        uint32_t dhcsr = 0;
+        if (!mem_read_block(CM_DHCSR, &dhcsr, 1u)) {
+            return false;
+        }
+        if ((dhcsr & DHCSR_IMPLAUSIBLE) != 0u) {
+            return false; // a constant, not a status: polling it cannot help
+        }
+        if ((dhcsr & DHCSR_S_REGRDY) != 0u) {
+            return true;
+        }
+        busy_wait_us_32(REGRDY_POLL_US);
+    }
+    return false;
+}
+
+bool raiden_swd_core_reg_write(uint8_t regsel, uint32_t value) {
+    // DCRDR first. DCRSR is what STARTS the transfer, so writing it before the
+    // data would hand the core whatever the previous access left in DCRDR --
+    // a wrong register value that the readback of a different register would
+    // never contradict.
+    if (!mem_write_word(CM_DCRDR, value)) {
         return false;
     }
-    return dp_read(DP_RDBUFF, &rdbuff);
+    if (!mem_write_word(CM_DCRSR, DCRSR_WRITE | (uint32_t)regsel)) {
+        return false;
+    }
+    return wait_regrdy();
+}
+
+bool raiden_swd_core_reg_read(uint8_t regsel, uint32_t* out) {
+    if (!mem_write_word(CM_DCRSR, (uint32_t)regsel)) {
+        return false;
+    }
+    if (!wait_regrdy()) {
+        return false;
+    }
+    return mem_read_block(CM_DCRDR, out, 1u);
+}
+
+void raiden_swd_forget_connection(void) {
+    connected = false;
+    raiden_ctrlap_forget();
+    swd_park_pins();
+}
+
+bool raiden_swd_resume(void) {
+    return mem_write_word(CM_DHCSR, DHCSR_RESUME_REQ);
+}
+
+bool raiden_swd_halt(uint32_t timeout_ms, uint32_t* dhcsr_out) {
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+
+    if (!mem_write_word(CM_DHCSR, DHCSR_HALT_REQ)) {
+        return false;
+    }
+    for (;;) {
+        uint32_t dhcsr = 0;
+        if (!mem_read_block(CM_DHCSR, &dhcsr, 1u)) {
+            return false;
+        }
+        if (dhcsr_out != NULL) {
+            *dhcsr_out = dhcsr;
+        }
+        if ((dhcsr & DHCSR_IMPLAUSIBLE) != 0u) {
+            // Where a locked part lands. Giving up AT ONCE rather than after
+            // the timeout is what keeps the nRF52 campaign's per-shot halt
+            // costing what it costed before this loop existed.
+            return false;
+        }
+        if ((dhcsr & DHCSR_S_HALT) != 0u) {
+            return true;
+        }
+        if ((dhcsr & DHCSR_S_RESET_ST) != 0u) {
+            // The core was in reset, so nobody is holding the request any
+            // more. Re-issue it instead of waiting out a timeout on a request
+            // that no longer exists.
+            if (!mem_write_word(CM_DHCSR, DHCSR_HALT_REQ)) {
+                return false;
+            }
+        }
+        if (time_reached(deadline)) {
+            return false;
+        }
+        busy_wait_us_32(HALT_POLL_US);
+    }
 }
 
 /* --- Commands -------------------------------------------------------- */
@@ -627,10 +800,7 @@ static bool mem_write_word(uint32_t addr, uint32_t value) {
  * base 0, so decimal is what they are meant to be.
  */
 static bool parse_hex_arg(const char* s, uint32_t* out) {
-    if (s == NULL || s[0] != '0' || (s[1] != 'X' && s[1] != 'x')) {
-        return false;
-    }
-    return raiden_parse_u32(s, out);
+    return raiden_parse_hex32(s, out);
 }
 
 static void cmd_connect(void) {
@@ -709,16 +879,11 @@ static void cmd_idcode(void) {
 }
 
 static void cmd_halt(void) {
-    uint32_t dhcsr = 0;
-    if (!mem_write_word(CM_DHCSR, DHCSR_HALT_REQ) || !mem_read_block(CM_DHCSR, &dhcsr, 1u)) {
-        rp_err("Halt failed");
-        return;
-    }
-    if ((dhcsr & DHCSR_S_HALT) == 0u) {
-        // Where a locked chip lands, with dhcsr = 0x23000000: the disabled AP
-        // answers OK and its constant has S_HALT clear. Failing here is the
-        // expected signature of a protected part, not a bench fault, and it
-        // needs no special case to produce.
+    // One request does not always take on a core that is running -- which is
+    // the BAT32 case, where SWD HALT is issued against application firmware in
+    // mid-execution and a single shot was enough only by luck. Both replies
+    // are unchanged: a locked part still fails, and still fails immediately.
+    if (!raiden_swd_halt(HALT_CLI_TIMEOUT_MS, NULL)) {
         rp_err("Halt failed");
         return;
     }
@@ -933,13 +1098,17 @@ static void cmd_write(int argc, char* argv[]) {
 
 void raiden_swd_command(int argc, char* argv[]) {
     if (argc < 2) {
-        rp_err("Usage: SWD <CONNECT|IDCODE|HALT|SPEED|READ|WRITE>");
+        rp_err("Usage: SWD <CONNECT|IDCODE|HALT|SPEED|READ|WRITE|BAT32>");
         swd_park_pins();
         return;
     }
     const char* sub = argv[1];
 
-    if (strcmp(sub, "CONNECT") == 0) {
+    if (strcmp(sub, "BAT32") == 0) {
+        // Its own module: a family's memory map and its bypass sequence do not
+        // belong in the transport that carries them.
+        raiden_bat32_command(argc, argv);
+    } else if (strcmp(sub, "CONNECT") == 0) {
         cmd_connect();
     } else if (strcmp(sub, "SPEED") == 0) {
         cmd_speed(argc, argv);
@@ -960,7 +1129,7 @@ void raiden_swd_command(int argc, char* argv[]) {
         // let a campaign keep shooting and keep scoring, against a bench that
         // was not doing what the operator believes.
         rp_err("Unknown SWD sub-command '%s' "
-               "(use CONNECT/IDCODE/HALT/SPEED/READ/WRITE)", sub);
+               "(use CONNECT/IDCODE/HALT/SPEED/READ/WRITE/BAT32)", sub);
     }
 
     // Released after EVERY command, not just at mode exit: the power cycle of

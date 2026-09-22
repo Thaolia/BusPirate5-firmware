@@ -116,6 +116,14 @@ void rp_hexdump(uint32_t addr, const uint8_t* buf, uint32_t nbytes) {
     rp_send("OK: Read complete\r\n");
 }
 
+void rp_words_line(uint32_t addr, const uint32_t* words, uint32_t nwords) {
+    rp_printf("0x%08X:", (unsigned)addr);
+    for (uint32_t i = 0; i < nwords; i++) {
+        rp_printf(" %08X", (unsigned)words[i]);
+    }
+    rp_send("\r\n");
+}
+
 void rp_reg_dp(uint8_t addr, uint32_t value) {
     rp_ok("DP[0x%X] = 0x%08X", (unsigned)addr, (unsigned)value);
 }

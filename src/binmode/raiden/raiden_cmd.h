@@ -29,6 +29,16 @@
 /** Parse a decimal or 0x-prefixed token. false leaves *out untouched. */
 bool raiden_parse_u32(const char* s, uint32_t* out);
 
+/** Parse a token that MUST carry the 0x prefix. false leaves *out untouched.
+ *
+ * Addresses go through this one and counts do not, because the dialect reads
+ * addresses base 16 and counts base 0 while raiden_parse_u32() defaults to
+ * base 10. A bare address token would not fail -- it would succeed at the
+ * WRONG address. `SWD READ 10000100` reads 0x989680 and reports it without a
+ * word of complaint, which on an anchor check reads exactly like a glitch.
+ */
+bool raiden_parse_hex32(const char* s, uint32_t* out);
+
 /* Command entry points. Each lives in its own translation unit so the modules
  * can be written independently; only the dispatch table below joins them. */
 void raiden_swd_command(int argc, char* argv[]);     /* raiden_swd.c    */

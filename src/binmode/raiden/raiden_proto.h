@@ -82,6 +82,25 @@ bool rp_take_truncated(void);
  */
 void rp_hexdump(uint32_t addr, const uint8_t* buf, uint32_t nbytes);
 
+/** One RAMREAD line: an address prefix and up to four 32-bit words.
+ *
+ * The OTHER dump format, and it is not interchangeable with rp_hexdump(). That
+ * one is 16 BYTES per line and the host reassembles it byte by byte; this one
+ * is 4 WORDS per line and the host reassembles it word by word, little-endian.
+ * Feeding either output to the other's parser reverses byte order within every
+ * word -- silently, because both look like a hexdump.
+ *
+ * The host's parser is anchored: nothing may precede the "0x", and nothing may
+ * follow the last word but the line terminator. It also keys each word on THIS
+ * line's own address, so the caller passes the address the data came FROM, not
+ * the address it was read from.
+ *
+ * No trailer here, deliberately. The host stops reading a reply at its first
+ * marker, so "OK:" belongs after the last line of a whole pass -- never once
+ * per block, the way rp_hexdump() emits it.
+ */
+void rp_words_line(uint32_t addr, const uint32_t* words, uint32_t nwords);
+
 /** Debug-port register read-back: "OK: DP[0x4] = 0x50000040". */
 void rp_reg_dp(uint8_t addr, uint32_t value);
 

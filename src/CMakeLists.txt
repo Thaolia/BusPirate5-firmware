@@ -543,6 +543,10 @@ set(buspirate_common
         binmode/raiden/raiden_power.h
         binmode/raiden/raiden_swd.c
         binmode/raiden/raiden_swd.h
+        binmode/raiden/raiden_target.c
+        binmode/raiden/raiden_target.h
+        binmode/raiden/raiden_bat32.c
+        binmode/raiden/raiden_bat32.h
         binmode/raiden/raiden_ctrlap.c
         binmode/raiden/raiden_ctrlap.h
         binmode/raiden/raiden_glitch.c
