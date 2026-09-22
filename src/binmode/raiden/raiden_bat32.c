@@ -340,6 +340,31 @@ static void cmd_ramread(int argc, char* argv[]) {
 }
 
 
+/* --- SWD OPT : les octets d'option, en lecture seule ------------------ */
+
+#define OPT_CLUSTER0 0x000000C0u  /* mot portant OCDEN a 0x000000C3 */
+#define OPT_CLUSTER1 0x000001C0u  /* miroir boot-swap, OCDEN a 0x000001C3 */
+#define OPT_OCDM_BTEN 0x00500004u /* OCDM = octet 0, BTEN = bit 0 de l'octet 1 */
+#define OPT_DBGSTOPCR 0x4001B004u
+#define OPT_SWDIS (1u << 24)
+#define OCDEN_PROTECTED 0xC3u
+#define OCDM_LEVEL2 0x3Cu
+
+/** Une lecture d'octet d'option, qui NETTOIE derriere elle si elle faute.
+ *
+ * Indispensable ici : au Level 1 une lecture flash rend ACK=FAULT, ce qui
+ * VERROUILLE le DP par STICKYERR. Sans ce nettoyage, la premiere lecture
+ * refusee ferait echouer toutes les suivantes -- et le rapport dirait que la
+ * data flash et DBGSTOPCR sont illisibles alors que seule la code flash l'est.
+ */
+static bool opt_read(uint32_t addr, uint32_t* out) {
+    if (raiden_swd_mem_read_block(addr, out, 1u)) {
+        return true;
+    }
+    (void)raiden_swd_abort_clear();
+    return false;
+}
+
 /* --- Option-byte programming ------------------------------------------
  *
  * Registers and key values come from the BAT32G135 User Manual section 29.4 as
@@ -361,25 +386,40 @@ static void cmd_ramread(int argc, char* argv[]) {
 #define FLOPMD1_PROGRAM 0xAAu
 #define FLOPMD2_PROGRAM 0x55u
 
-/* OCDEN, cluster 0 -- the one consulted while BTEN=1, its power-on default.
- * The boot-swap cluster (0x000001C3) is NOT handled here: this binmode has no
- * way to read BTEN back, and arming the wrong cluster would leave a part that
- * looks unlocked while a second copy of the byte says otherwise. */
-#define OCDEN_ADDR      0x000000C3u
-#define OCDEN_PROTECTED 0xC3u
+/* ★ QUEL OCDEN ? Celui du cluster que BTEN designe, jamais un cluster presume.
+ *
+ * ⚠⚠ Corrige le 2026-09-22 apres une lecture de `SWD OPT` sur le banc. Cette
+ * fonction ecrivait le cluster 0 EN DUR, en se justifiant par « ce binmode ne
+ * sait pas relire BTEN ». Depuis `SWD OPT`, il sait. Armer le cluster qui ne
+ * gouverne pas laisserait une puce qui PARAIT non verrouillee alors qu'un
+ * second exemplaire de l'octet dit le contraire -- et rien, au banc, ne
+ * distinguerait ce cas d'un armement qui n'a pas pris. */
+#define OCDEN_IN_CLUSTER 0x03u   /* OCDEN = 4e octet du mot de cluster */
 
-#define OCDEN_WORD      (OCDEN_ADDR & ~3u)
-#define OCDEN_LANE      (OCDEN_ADDR & 3u)
 #define PROGRAM_POLL_MS 2u
 #define PROGRAM_TRIES   50u
 
-/** Read OCDEN back. The word read is masked down to its byte lane. */
-static bool ocden_read(uint8_t* out) {
+/** Read OCDEN back from @p addr. The word read is masked down to its byte lane. */
+static bool ocden_read(uint32_t addr, uint8_t* out) {
     uint32_t word = 0;
-    if (!raiden_swd_mem_read_block(OCDEN_WORD, &word, 1u)) {
+    if (!opt_read(addr & ~3u, &word)) {
         return false;
     }
-    *out = (uint8_t)((word >> (8u * OCDEN_LANE)) & 0xFFu);
+    *out = (uint8_t)((word >> (8u * (addr & 3u))) & 0xFFu);
+    return true;
+}
+
+/** Which OCDEN governs? Rend false si BTEN est illisible -- et c'est un REFUS,
+ *  pas un defaut: presumer le cluster est precisement la faute corrigee ici. */
+static bool ocden_addr_governing(uint32_t* addr, unsigned* bten_out) {
+    uint32_t om = 0;
+    if (!opt_read(OPT_OCDM_BTEN, &om)) {
+        return false;
+    }
+    unsigned bten = (unsigned)((om >> 8) & 1u);
+    /* BTEN=0 => boot-swap ACTIF => c'est le cluster 1 qui gouverne. */
+    *addr = ((bten == 0u) ? OPT_CLUSTER1 : OPT_CLUSTER0) | OCDEN_IN_CLUSTER;
+    *bten_out = bten;
     return true;
 }
 
@@ -403,14 +443,29 @@ static void cmd_arm(int argc, char* argv[]) {
         return;
     }
 
+    /* ★ BTEN d'abord, avant toute autre lecture et bien avant toute ecriture.
+     * Un refus ici coute un message; un mauvais cluster coute une puce dont
+     * l'etat ne se lit plus nulle part. */
+    uint32_t ocden_addr = 0;
+    unsigned bten = 0;
+    if (!ocden_addr_governing(&ocden_addr, &bten)) {
+        rp_err("Cannot read BTEN (0x%08X): refusing to arm. Which OCDEN governs "
+               "depends on it, and writing the wrong cluster leaves a part that "
+               "LOOKS unlocked while its other copy says otherwise. Check the link "
+               "with SWD OPT first",
+               (unsigned)(OPT_OCDM_BTEN + 1u));
+        return;
+    }
+
     uint8_t before = 0;
-    if (!ocden_read(&before)) {
-        rp_err("Cannot read OCDEN: the debug port is not answering. Refusing to "
-               "program an option byte blind");
+    if (!ocden_read(ocden_addr, &before)) {
+        rp_err("Cannot read OCDEN at 0x%08X: the debug port is not answering there. "
+               "Refusing to program an option byte blind", (unsigned)ocden_addr);
         return;
     }
     if (before == OCDEN_PROTECTED) {
-        rp_ok("OCDEN already 0xC3 (Level 1) -- nothing to do");
+        rp_ok("OCDEN at 0x%08X already 0xC3 (Level 1) -- nothing to do",
+              (unsigned)ocden_addr);
         return;
     }
 
@@ -420,10 +475,11 @@ static void cmd_arm(int argc, char* argv[]) {
     if (!raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_UNLOCK) ||
         !raiden_swd_mem_write_byte(FL_FLOPMD1, FLOPMD1_PROGRAM) ||
         !raiden_swd_mem_write_byte(FL_FLOPMD2, FLOPMD2_PROGRAM) ||
-        !raiden_swd_mem_write_byte(OCDEN_ADDR, OCDEN_PROTECTED)) {
+        !raiden_swd_mem_write_byte(ocden_addr, OCDEN_PROTECTED)) {
         (void)raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_RELOCK);
         rp_err("Option-byte write sequence failed on the bus -- OCDEN may be "
-               "unchanged OR half-written. Read it back before doing anything else");
+               "unchanged OR half-written. Read it back with SWD OPT before doing "
+               "anything else");
         return;
     }
 
@@ -431,7 +487,7 @@ static void cmd_arm(int argc, char* argv[]) {
     bool armed = false;
     for (uint32_t i = 0; i < PROGRAM_TRIES; i++) {
         busy_wait_ms(PROGRAM_POLL_MS);
-        if (ocden_read(&after) && after == OCDEN_PROTECTED) {
+        if (ocden_read(ocden_addr, &after) && after == OCDEN_PROTECTED) {
             armed = true;
             break;
         }
@@ -442,12 +498,14 @@ static void cmd_arm(int argc, char* argv[]) {
     (void)raiden_swd_mem_write_byte(FL_FLPROT, FLPROT_RELOCK);
 
     if (!armed) {
-        rp_err("OCDEN still 0x%02X after %u ms: the write did not take", (unsigned)after,
+        rp_err("OCDEN at 0x%08X still 0x%02X after %u ms: the write did not take",
+               (unsigned)ocden_addr, (unsigned)after,
                (unsigned)(PROGRAM_TRIES * PROGRAM_POLL_MS));
         return;
     }
-    rp_ok("OCDEN 0x%02X -> 0xC3, protection Level 1 (effective at the next reset)",
-          (unsigned)before);
+    rp_ok("OCDEN at 0x%08X (cluster %u, BTEN=%u) 0x%02X -> 0xC3, protection Level 1 "
+          "(effective at the next reset)",
+          (unsigned)ocden_addr, (bten == 0u) ? 1u : 0u, bten, (unsigned)before);
 }
 
 static void cmd_help(void) {
@@ -486,30 +544,6 @@ void raiden_bat32_command(int argc, char* argv[]) {
            "ARM; the other destructive verbs are deliberately absent)", argv[2]);
 }
 
-/* --- SWD OPT : les octets d'option, en lecture seule ------------------ */
-
-#define OPT_CLUSTER0 0x000000C0u  /* mot portant OCDEN a 0x000000C3 */
-#define OPT_CLUSTER1 0x000001C0u  /* miroir boot-swap, OCDEN a 0x000001C3 */
-#define OPT_OCDM_BTEN 0x00500004u /* OCDM = octet 0, BTEN = bit 0 de l'octet 1 */
-#define OPT_DBGSTOPCR 0x4001B004u
-#define OPT_SWDIS (1u << 24)
-#define OCDEN_PROTECTED 0xC3u
-#define OCDM_LEVEL2 0x3Cu
-
-/** Une lecture d'octet d'option, qui NETTOIE derriere elle si elle faute.
- *
- * Indispensable ici : au Level 1 une lecture flash rend ACK=FAULT, ce qui
- * VERROUILLE le DP par STICKYERR. Sans ce nettoyage, la premiere lecture
- * refusee ferait echouer toutes les suivantes -- et le rapport dirait que la
- * data flash et DBGSTOPCR sont illisibles alors que seule la code flash l'est.
- */
-static bool opt_read(uint32_t addr, uint32_t* out) {
-    if (raiden_swd_mem_read_block(addr, out, 1u)) {
-        return true;
-    }
-    (void)raiden_swd_abort_clear();
-    return false;
-}
 
 void raiden_bat32_opt(void) {
     uint32_t c0 = 0, c1 = 0, om = 0, dbg = 0;
